@@ -1,3 +1,5 @@
-idf_component_register(SRCS "transmit_sensor_can.c"
+idf_component_register(
+    SRCS "main.c"
     REQUIRES esp_driver_twai esp_timer
-    INCLUDE_DIRS ".")
+    INCLUDE_DIRS "."
+)
