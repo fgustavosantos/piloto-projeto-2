@@ -6,20 +6,18 @@
 
 #include <stdio.h>
 #include <string.h>
-#include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_twai.h"
 #include "esp_twai_onchip.h"
 
-#define TWAI_LISTENER_TX_GPIO   19  // Listen only node doesn't need TX pin
-#define TWAI_LISTENER_RX_GPIO   20
-#define TWAI_BITRATE            100000
+#define TWAI_LISTENER_TX_GPIO   -1  // Listen only node doesn't need TX pin
+#define TWAI_LISTENER_RX_GPIO   GPIO_NUM_5
+#define TWAI_BITRATE            250000
 
 // Message IDs (must match sender)
 #define TWAI_DATA_ID            0x100
-#define TWAI_HEARTBEAT_ID       0x7FF
 
 // Buffer for burst data handling
 #define POLL_DEPTH              200
@@ -108,16 +106,14 @@ void app_main(void)
     ESP_ERROR_CHECK(twai_new_node_onchip(&node_config, &twai_listener_ctx.node_hdl));
     ESP_LOGI(TAG, "TWAI node created");
 
-    // Configure acceptance filter - ESP32-C6 aceita apenas 1 filtro
-    // Usar máscara 0x000 para aceitar TODOS os IDs standard (0x000-0x7FF)
-    // Filtragem específica de IDs será feita no software
-    twai_mask_filter_config_t filter = {
-        .id = 0x000,
-        .mask = 0x000,          // Máscara 0x000 = Aceita TODOS os IDs
-        .is_ext = false,        // Receive only standard ID
+    // Configure acceptance filter
+    twai_mask_filter_config_t data_filter = {
+        .id = TWAI_DATA_ID,
+        .mask = 0x7F0,      // Match high 7 bits of the ID, ignore low 4 bits
+        .is_ext = false,    // Receive only standard ID
     };
-    ESP_ERROR_CHECK(twai_node_config_mask_filter(twai_listener_ctx.node_hdl, 0, &filter));
-    ESP_LOGI(TAG, "Filter enabled: Accepting ALL standard CAN IDs (0x000-0x7FF)");
+    ESP_ERROR_CHECK(twai_node_config_mask_filter(twai_listener_ctx.node_hdl, 0, &data_filter));
+    ESP_LOGI(TAG, "Filter enabled for ID: 0x%03X Mask: 0x%03X", data_filter.id, data_filter.mask);
 
     // Register callbacks
     twai_event_callbacks_t callbacks = {
@@ -135,32 +131,10 @@ void app_main(void)
     while (1) {
         if (xSemaphoreTake(twai_listener_ctx.rx_result_semaphore, portMAX_DELAY) == pdTRUE) {
             twai_frame_t *frame = &twai_listener_ctx.rx_pool[twai_listener_ctx.read_idx].frame;
-            
-            // Log usando ESP_LOGI
-            ESP_LOGI(TAG, "RX: timestamp %" PRIu64 ", ID: 0x%03" PRIx32 " [DLC:%d]", \
-                     frame->header.timestamp, frame->header.id, frame->header.dlc);
-            
-            // Exibir via printf com formatação clara
-            printf("[TWAI RX] ");
-            
-            // Identificar tipo de mensagem
-            if (frame->header.id == TWAI_DATA_ID) {
-                printf("BURST DATA - ");
-            } else if (frame->header.id == TWAI_HEARTBEAT_ID) {
-                printf("HEARTBEAT  - ");
-            } else {
-                printf("UNKNOWN    - ");
-            }
-            
-            printf("ID: 0x%03" PRIx32 " | Timestamp: %" PRIu64 " | DLC: %d | Data: ", 
-                   frame->header.id, frame->header.timestamp, frame->header.dlc);
-            
-            // Exibir dados
-            for (int i = 0; i < frame->header.dlc && i < TWAI_FRAME_MAX_LEN; i++) {
-                printf("%02X ", frame->buffer[i]);
-            }
-            printf("\n");
-            
+            ESP_LOGI(TAG, "RX: timestamp %llu, %x [%d] %x %x %x %x %x %x %x %x", \
+                     frame->header.timestamp, frame->header.id, frame->header.dlc, \
+                     frame->buffer[0], frame->buffer[1], frame->buffer[2], frame->buffer[3], \
+                     frame->buffer[4], frame->buffer[5], frame->buffer[6], frame->buffer[7]);
             twai_listener_ctx.read_idx = (twai_listener_ctx.read_idx + 1) % POLL_DEPTH;
             xSemaphoreGive(twai_listener_ctx.free_pool_semaphore);
         }
