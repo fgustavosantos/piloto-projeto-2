@@ -1,59 +1,55 @@
-/*
- * SPDX-FileCopyrightText: 2025-2026 Espressif Systems (Shanghai) CO LTD
- *
- * SPDX-License-Identifier: Apache-2.0
- */
-
 #include <stdio.h>
-#include <string.h>
-#include <sys/param.h>
+#include <inttypes.h>
 #include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_twai.h"
 #include "esp_twai_onchip.h"
 
-#define TWAI_SENDER_TX_GPIO     GPIO_NUM_4
-#define TWAI_SENDER_RX_GPIO     GPIO_NUM_5
+#define TWAI_SENDER_TX_GPIO     4
+#define TWAI_SENDER_RX_GPIO     5
 #define TWAI_QUEUE_DEPTH        10
-#define TWAI_BITRATE            250000
+#define TWAI_BITRATE            250000 
 
-// Message IDs
-#define TWAI_DATA_ID            0x100
-#define TWAI_HEARTBEAT_ID       0x7FF
-#define TWAI_EMERGENCY_ID       0x080
-#define TWAI_DATA_LEN           1000
+#define CAN_ID_AGUA             0x0C1
+#define CAN_ID_FLUXO            0x0C2
 
-static const char *TAG = "twai_sender";
+static const char *TAG = "aquaponia_sender";
 
 typedef struct {
-    twai_frame_t frame;
-    uint8_t data[TWAI_FRAME_MAX_LEN];
-} twai_sender_data_t;
+    float ph;
+    float temperatura;
+} sensores_agua_t;
 
-// Transmission completion callback
-static IRAM_ATTR bool twai_sender_tx_done_callback(twai_node_handle_t handle, const twai_tx_done_event_data_t *edata, void *user_ctx)
-{
-    if (!edata->is_tx_success) {
-        ESP_EARLY_LOGW(TAG, "Failed to transmit message, ID: 0x%X", edata->done_tx_frame->header.id);
-    }
-    return false; // No task wake required
+typedef struct {
+    float fluxo;
+    float tds;
+} sensores_fluxo_t;
+
+float simular_sensor(float min, float max) {
+    float random_normalizado = (float)esp_random() / (float)UINT32_MAX;
+    return min + (random_normalizado * (max - min));
 }
 
-// Bus error callback
-static IRAM_ATTR bool twai_sender_on_error_callback(twai_node_handle_t handle, const twai_error_event_data_t *edata, void *user_ctx)
-{
-    ESP_EARLY_LOGW(TAG, "TWAI node error: 0x%x", edata->err_flags.val);
-    return false; // No task wake required
+static IRAM_ATTR bool twai_sender_tx_done_callback(twai_node_handle_t handle, const twai_tx_done_event_data_t *edata, void *user_ctx) {
+    if (!edata->is_tx_success) {
+        ESP_EARLY_LOGW(TAG, "Falha ao enviar, ID: 0x%" PRIx32, edata->done_tx_frame->header.id);
+    }
+    return false;
+}
+
+static IRAM_ATTR bool twai_sender_on_error_callback(twai_node_handle_t handle, const twai_error_event_data_t *edata, void *user_ctx) {
+    ESP_EARLY_LOGW(TAG, "Erro no barramento: 0x%x", edata->err_flags.val);
+    return false; 
 }
 
 void app_main(void)
 {
     twai_node_handle_t sender_node = NULL;
-    printf("===================TWAI Sender Example Starting...===================\n");
+    printf("=================== Iniciando Simulador de Aquaponia ===================\n");
 
-    // Configure TWAI node
     twai_onchip_node_config_t node_config = {
         .io_cfg = {
             .tx = TWAI_SENDER_TX_GPIO,
@@ -68,69 +64,58 @@ void app_main(void)
         .tx_queue_depth = TWAI_QUEUE_DEPTH,
     };
 
-    // Create TWAI node
     ESP_ERROR_CHECK(twai_new_node_onchip(&node_config, &sender_node));
 
-    // Register transmission completion callback
     twai_event_callbacks_t callbacks = {
         .on_tx_done = twai_sender_tx_done_callback,
         .on_error = twai_sender_on_error_callback,
     };
     ESP_ERROR_CHECK(twai_node_register_event_callbacks(sender_node, &callbacks, NULL));
-
-    // Enable TWAI node
     ESP_ERROR_CHECK(twai_node_enable(sender_node));
-    ESP_LOGI(TAG, "TWAI Sender started successfully");
-    ESP_LOGI(TAG, "Sending messages with IDs: 0x%03X (data), 0x%03X (heartbeat)",  TWAI_DATA_ID, TWAI_HEARTBEAT_ID);
+
+    ESP_LOGI(TAG, "Transmissor CAN iniciado a 100 kbps");
 
     while (1) {
-        // Send heartbeat message
         uint64_t timestamp = esp_timer_get_time();
-        twai_frame_t tx_frame = {
-            .header.id = TWAI_HEARTBEAT_ID,
-            .buffer = (uint8_t *) &timestamp,
-            .buffer_len = sizeof(timestamp),
+
+        //Gerar os dados dos sensores
+        sensores_agua_t dados_agua = {
+            .ph = simular_sensor(6.5, 7.5),
+            .temperatura = simular_sensor(22.0, 26.0)
         };
-        ESP_ERROR_CHECK(twai_node_transmit(sender_node, &tx_frame, 500));
-        ESP_LOGI(TAG, "Sending heartbeat message: %lld", timestamp);
-        ESP_ERROR_CHECK(twai_node_transmit_wait_all_done(sender_node, -1)); // -1 means wait forever
 
-        // Send burst data messages every 10 seconds
-        if ((timestamp / 1000000) % 10 == 0) {
-            int num_frames = howmany(TWAI_DATA_LEN, TWAI_FRAME_MAX_LEN);
-            twai_sender_data_t *data = (twai_sender_data_t *)calloc(num_frames, sizeof(twai_sender_data_t));
-            assert(data != NULL);
-            ESP_LOGI(TAG, "Sending packet of %d bytes in %d frames", TWAI_DATA_LEN, num_frames);
-            for (int i = 0; i < num_frames; i++) {
-                data[i].frame.header.id = TWAI_DATA_ID;
-                data[i].frame.buffer = data[i].data;
-                data[i].frame.buffer_len = TWAI_FRAME_MAX_LEN;
-                memset(data[i].data, i, TWAI_FRAME_MAX_LEN);
-                ESP_ERROR_CHECK(twai_node_transmit(sender_node, &data[i].frame, 500));
-            }
+        sensores_fluxo_t dados_fluxo = {
+            .fluxo = simular_sensor(10.0, 15.0),
+            .tds = simular_sensor(300.0, 500.0)
+        };
 
-            // Insert an emergency frame with high priority
-            // This frame will be transmitted before the queue remaining data frames
-            twai_frame_t emergency_frame = {
-                .header.id = TWAI_EMERGENCY_ID,
-            };
-            ESP_LOGI(TAG, "Inserting Emergency message: 0x%03X", TWAI_EMERGENCY_ID);
-            ESP_ERROR_CHECK(twai_node_transmit(sender_node, &emergency_frame, 500));
+        twai_frame_t frame_agua = {
+            .header.id = CAN_ID_AGUA,
+            .buffer = (uint8_t *) &dados_agua,
+            .buffer_len = sizeof(sensores_agua_t),
+        };
+        ESP_ERROR_CHECK(twai_node_transmit(sender_node, &frame_agua, pdMS_TO_TICKS(100)));
 
-            // Frames mounted, wait for all frames to be transmitted
-            ESP_ERROR_CHECK(twai_node_transmit_wait_all_done(sender_node, -1));
-            free(data);
-        }
+        twai_frame_t frame_fluxo = {
+            .header.id = CAN_ID_FLUXO,
+            .buffer = (uint8_t *) &dados_fluxo,
+            .buffer_len = sizeof(sensores_fluxo_t),
+        };
+        ESP_ERROR_CHECK(twai_node_transmit(sender_node, &frame_fluxo, pdMS_TO_TICKS(100)));
 
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        printf("[%" PRIu64 " us] Enviado -> ID 0x%03X [pH: %.2f | Temp: %.2f C]\n", timestamp, CAN_ID_AGUA, dados_agua.ph, dados_agua.temperatura);
+        printf("[%" PRIu64 " us] Enviado -> ID 0x%03X [Fluxo: %.2f L/m | TDS: %.0f ppm]\n", timestamp, CAN_ID_FLUXO, dados_fluxo.fluxo, dados_fluxo.tds);
+
+        ESP_ERROR_CHECK(twai_node_transmit_wait_all_done(sender_node, -1));
+
+        // Verificação de segurança (Bus-off)
         twai_node_status_t status;
         twai_node_get_info(sender_node, &status, NULL);
         if (status.state == TWAI_ERROR_BUS_OFF) {
-            ESP_LOGW(TAG, "Bus-off detected");
+            ESP_LOGW(TAG, "Bus-off detectado! Verifique os cabos e o Listener.");
             return;
         }
-    }
 
-    ESP_ERROR_CHECK(twai_node_disable(sender_node));
-    ESP_ERROR_CHECK(twai_node_delete(sender_node));
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
 }
